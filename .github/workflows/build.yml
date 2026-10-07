@@ -42,8 +42,8 @@ jobs:
             sed -i 's/android:label="[^"]*"/android:label="A-Z Live"/' "$MANIFEST"
           fi
 
-      # حقن سكربت تهيئة Gradle العالمي لإجبار compileSdk 36 و minSdk 24 على كافة الحزم والمشروع
-      - name: إعداد توافق Gradle الشامل (SDK 36)
+      # إعداد توافق Gradle الشامل (SDK 36) وتجاوز مشاكل تحميل NDK التالفة
+      - name: إعداد توافق Gradle وتجاوز NDK
         run: |
           mkdir -p ~/.gradle/init.d
           cat << 'EOF' > ~/.gradle/init.d/override_sdk.gradle
@@ -75,9 +75,9 @@ jobs:
             echo "ملفات الأيقونة غير موجودة، سيتم استخدام الأيقونة الافتراضية"
           fi
 
-      # بناء الـ APK
+      # بناء الـ APK بدون تنزيل NDK تلقائي
       - name: بناء APK
-        run: flutter build apk --release --dart-define=GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+        run: flutter build apk --release --no-pub --dart-define=GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
 
       - name: رفع ملف APK
         uses: actions/upload-artifact@v4
