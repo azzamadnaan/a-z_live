@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ui';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../services/gemini_live_service.dart';
@@ -602,4 +603,67 @@ class _WavePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_WavePainter old) => true;
+}
+
+// =============== نص حقوق المبرمج بتدرج لوني متحرك ===============
+class AnimatedGradientText extends StatefulWidget {
+  final double fontSize;
+  const AnimatedGradientText({super.key, this.fontSize = 14});
+
+  @override
+  State<AnimatedGradientText> createState() => _AnimatedGradientTextState();
+}
+
+class _AnimatedGradientTextState extends State<AnimatedGradientText>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 3),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, child) {
+        return ShaderMask(
+          shaderCallback: (bounds) {
+            return LinearGradient(
+              colors: const [
+                Color(0xFF7C5CFF),
+                Color(0xFF22D3EE),
+                Color(0xFF2ECC71),
+              ],
+              stops: [
+                0.0,
+                _controller.value,
+                1.0,
+              ],
+            ).createShader(bounds);
+          },
+          child: Text(
+            'جميع الحقوق محفوظة لدى المبرمج عزام عدنان المخلافي',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: widget.fontSize,
+              fontWeight: FontWeight.bold,
+              color: Colors.white,
+            ),
+          ),
+        );
+      },
+    );
+  }
 }
