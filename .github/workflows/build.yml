@@ -24,41 +24,46 @@ jobs:
           channel: stable
           cache: true
 
-      # لو لم يكن مجلد android موجوداً في المستودع نولّده تلقائياً
+      # توليد مجلد أندرويد إذا لم يكن موجوداً
       - name: توليد مشروع أندرويد عند الحاجة
         run: |
           if [ ! -d android ]; then
             flutter create --platforms=android --project-name az_live --org com.azlive .
           fi
 
-      # الصلاحيات + اسم التطبيق + رفع minSdk إلى 24 و compileSdk إلى 34
-      - name: ضبط الصلاحيات واسم التطبيق والـ SDK
+      # ضبط صلاحيات الأندرويد اسم التطبيق
+      - name: ضبط الصلاحيات واسم التطبيق
         run: |
           MANIFEST=android/app/src/main/AndroidManifest.xml
-          if ! grep -q "RECORD_AUDIO" "$MANIFEST"; then
-            sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <application|' "$MANIFEST"
+          if [ -f "$MANIFEST" ]; then
+            if ! grep -q "RECORD_AUDIO" "$MANIFEST"; then
+              sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET"/>\n    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>\n    <application|' "$MANIFEST"
+            fi
+            sed -i 's/android:label="[^"]*"/android:label="A-Z Live"/' "$MANIFEST"
           fi
-          sed -i 's/android:label="[^"]*"/android:label="A-Z Live"/' "$MANIFEST"
 
-          for f in android/app/build.gradle android/app/build.gradle.kts; do
+      # تعديل minSdk و compileSdk لملفات أندرويد بدقة لتفادي أخطاء السنتكس
+      - name: تعديل إعدادات SDK في أندرويد
+        run: |
+          for f in android/app/build.gradle.kts android/app/build.gradle; do
             if [ -f "$f" ]; then
-              sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' "$f"
-              sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 34/; s/compileSdkVersion flutter.compileSdkVersion/compileSdkVersion 34/; s/compileSdk [0-9]*/compileSdk 34/; s/compileSdkVersion [0-9]*/compileSdkVersion 34/' "$f"
+              sed -i 's/compileSdk[[:space:]]*=.*/compileSdk = 34/' "$f"
+              sed -i 's/compileSdkVersion[[:space:]].*/compileSdkVersion 34/' "$f"
+              sed -i 's/minSdk[[:space:]]*=.*/minSdk = 24/' "$f"
+              sed -i 's/minSdkVersion[[:space:]].*/minSdkVersion 24/' "$f"
             fi
           done
 
       - name: تحميل الحزم
         run: flutter pub get
 
-      # ترقية compileSdk تلقائياً لجميع المكتبات المحملة (مثل flutter_pcm_sound) إلى 34
+      # ترقية compileSdk في المكتبات الخارجية إلى 34 لتوافق flutter_pcm_sound
       - name: ترقية compileSdk في المكتبات الخارجية إلى 34
         run: |
-          find ~/.pub-cache -name "build.gradle*" -exec sed -i 's/compileSdkVersion [0-9]*/compileSdkVersion 34/g' {} +
-          find ~/.pub-cache -name "build.gradle*" -exec sed -i 's/compileSdk [0-9]*/compileSdk 34/g' {} +
-          find ~/.pub-cache -name "build.gradle*" -exec sed -i 's/compileSdkVersion = [0-9]*/compileSdkVersion = 34/g' {} +
-          find ~/.pub-cache -name "build.gradle*" -exec sed -i 's/compileSdk = [0-9]*/compileSdk = 34/g' {} +
+          find ~/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion[[:space:]].*/compileSdkVersion 34/g' {} +
+          find ~/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdk[[:space:]]*=.*/compileSdk = 34/g' {} +
 
-      # توليد الأيقونة إذا وُجد ملفا الأيقونة
+      # توليد الأيقونة عند توفر الصور
       - name: توليد أيقونة التطبيق
         run: |
           if [ -f assets/images/app_icon.png ] && [ -f assets/images/app_icon_foreground.png ]; then
@@ -67,7 +72,7 @@ jobs:
             echo "ملفات الأيقونة غير موجودة، سيتم استخدام الأيقونة الافتراضية"
           fi
 
-      # بناء التطبيق
+      # بناء الـ APK
       - name: بناء APK
         run: flutter build apk --release --dart-define=GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
 
