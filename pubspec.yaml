@@ -1,0 +1,41 @@
+name: az_live
+description: A-Z Live - تعلّم الإنجليزية مباشرة مع Gemini Live
+publish_to: none
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  web_socket_channel: ^3.0.1
+  record: ^5.1.2
+  flutter_pcm_sound: ^3.1.0
+  audioplayers: ^6.1.0
+  video_player: ^2.9.2
+  lottie: ^3.1.2
+  shared_preferences: ^2.3.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  flutter_launcher_icons: ^0.14.1
+
+# إعدادات توليد أيقونة التطبيق (تُنفَّذ في GitHub Actions)
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/images/app_icon.png"
+  adaptive_icon_background: "#0B0D17"
+  adaptive_icon_foreground: "assets/images/app_icon_foreground.png"
+  min_sdk_android: 24
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/videos/
+    - assets/images/
+    - assets/audio/
+    - assets/lottie/
