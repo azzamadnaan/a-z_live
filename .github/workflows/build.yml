@@ -24,14 +24,14 @@ jobs:
           channel: stable
           cache: true
 
-      # توليد مجلد أندرويد إذا لم يكن موجوداً
+      # توليد مجلد أندرويد عند الحاجة
       - name: توليد مشروع أندرويد عند الحاجة
         run: |
           if [ ! -d android ]; then
             flutter create --platforms=android --project-name az_live --org com.azlive .
           fi
 
-      # ضبط صلاحيات الأندرويد اسم التطبيق
+      # ضبط الصلاحيات واسم التطبيق
       - name: ضبط الصلاحيات واسم التطبيق
         run: |
           MANIFEST=android/app/src/main/AndroidManifest.xml
@@ -42,26 +42,29 @@ jobs:
             sed -i 's/android:label="[^"]*"/android:label="A-Z Live"/' "$MANIFEST"
           fi
 
-      # تعديل minSdk و compileSdk لملفات أندرويد بدقة لتفادي أخطاء السنتكس
-      - name: تعديل إعدادات SDK في أندرويد
+      # حقن سكربت تهيئة Gradle العالمي لإجبار compileSdk 36 و minSdk 24 على كافة الحزم والمشروع
+      - name: إعداد توافق Gradle الشامل (SDK 36)
         run: |
-          for f in android/app/build.gradle.kts android/app/build.gradle; do
-            if [ -f "$f" ]; then
-              sed -i 's/compileSdk[[:space:]]*=.*/compileSdk = 34/' "$f"
-              sed -i 's/compileSdkVersion[[:space:]].*/compileSdkVersion 34/' "$f"
-              sed -i 's/minSdk[[:space:]]*=.*/minSdk = 24/' "$f"
-              sed -i 's/minSdkVersion[[:space:]].*/minSdkVersion 24/' "$f"
-            fi
-          done
+          mkdir -p ~/.gradle/init.d
+          cat << 'EOF' > ~/.gradle/init.d/override_sdk.gradle
+          gradle.projectsLoaded {
+              rootProject.allprojects {
+                  afterEvaluate { p ->
+                      if (p.hasProperty('android')) {
+                          p.android {
+                              compileSdkVersion 36
+                              defaultConfig {
+                                  minSdkVersion 24
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
 
       - name: تحميل الحزم
         run: flutter pub get
-
-      # ترقية compileSdk في المكتبات الخارجية إلى 34 لتوافق flutter_pcm_sound
-      - name: ترقية compileSdk في المكتبات الخارجية إلى 34
-        run: |
-          find ~/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdkVersion[[:space:]].*/compileSdkVersion 34/g' {} +
-          find ~/.pub-cache -name "build.gradle" -exec sed -i 's/compileSdk[[:space:]]*=.*/compileSdk = 34/g' {} +
 
       # توليد الأيقونة عند توفر الصور
       - name: توليد أيقونة التطبيق
