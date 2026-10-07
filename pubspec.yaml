@@ -10,12 +10,17 @@ dependencies:
   flutter:
     sdk: flutter
   web_socket_channel: ^3.0.1
-  record: ^5.1.2
+  record: ^5.2.0
   flutter_pcm_sound: ^3.1.0
   audioplayers: ^6.1.0
   video_player: ^2.9.2
   lottie: ^3.1.2
   shared_preferences: ^2.3.2
+
+# حل تعارض مكتبات التسجيل في سحابة GitHub Actions
+dependency_overrides:
+  record_linux: ^0.7.3
+  record_platform_interface: ^1.2.5
 
 dev_dependencies:
   flutter_test:
