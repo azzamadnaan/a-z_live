@@ -1,102 +1,124 @@
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
-/// يبدّل بين فيديو idle وفيديو speaking بسلاسة (Cross-fade)
-/// - idle يعمل دائماً في حلقة
-/// - speaking يبدأ من الصفر لحظة speaking=true ويتوقف فوراً عند false
+/// ويدجت عرض فيديو الأفاتار بدون تقطيع أو تذبذب
 class AvatarAnimationWidget extends StatefulWidget {
   final bool speaking;
-  const AvatarAnimationWidget({super.key, required this.speaking});
+
+  const AvatarAnimationWidget({
+    super.key,
+    required this.speaking,
+  });
 
   @override
   State<AvatarAnimationWidget> createState() => _AvatarAnimationWidgetState();
 }
 
 class _AvatarAnimationWidgetState extends State<AvatarAnimationWidget> {
-  late final VideoPlayerController _idle;
-  late final VideoPlayerController _talk;
-  bool _ok = false;
-  bool _failed = false;
+  late VideoPlayerController _idleController;
+  late VideoPlayerController _speakingController;
+  bool _isInitialized = false;
 
   @override
   void initState() {
     super.initState();
-    _idle = VideoPlayerController.asset(
-      'assets/videos/idle_avatar.mp4',
-      videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
-    );
-    _talk = VideoPlayerController.asset(
-      'assets/videos/speaking_avatar.mp4',
-      videoPlayerOptions: VideoPlayerOptions(mixWithOthers: true),
-    );
-    _init();
+    _initVideoControllers();
   }
 
-  Future<void> _init() async {
+  /// تحميل الفيديويين مسبقاً في الذاكرة لمنع أي ومضات أثناء التبديل
+  Future<void> _initVideoControllers() async {
+    _idleController =
+        VideoPlayerController.asset('assets/videos/idle_avatar.mp4');
+    _speakingController =
+        VideoPlayerController.asset('assets/videos/speaking_avatar.mp4');
+
     try {
-      await Future.wait([_idle.initialize(), _talk.initialize()]);
-      for (final c in [_idle, _talk]) {
-        await c.setLooping(true);
-        await c.setVolume(0); // الصوت يأتي من Gemini وليس من الفيديو
+      await Future.wait([
+        _idleController.initialize(),
+        _speakingController.initialize(),
+      ]);
+
+      _idleController.setLooping(true);
+      _speakingController.setLooping(true);
+
+      _idleController.play();
+      _speakingController.play();
+
+      if (mounted) {
+        setState(() {
+          _isInitialized = true;
+        });
       }
-      await _idle.play();
-      if (widget.speaking) await _talk.play();
-      if (mounted) setState(() => _ok = true);
-    } catch (_) {
-      if (mounted) setState(() => _failed = true);
+    } catch (e) {
+      debugPrint("خطأ في تحميل الفيديوهات: $e");
     }
   }
 
   @override
-  void didUpdateWidget(covariant AvatarAnimationWidget old) {
-    super.didUpdateWidget(old);
-    if (!_ok || old.speaking == widget.speaking) return;
-    if (widget.speaking) {
-      _talk.seekTo(Duration.zero).then((_) => _talk.play());
-    } else {
-      _talk.pause();
+  void didUpdateWidget(AvatarAnimationWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // عند تغير الحالة فقط
+    if (oldWidget.speaking != widget.speaking && _isInitialized) {
+      if (widget.speaking) {
+        _speakingController.seekTo(Duration.zero);
+        _speakingController.play();
+      } else {
+        _idleController.play();
+      }
     }
   }
 
   @override
   void dispose() {
-    _idle.dispose();
-    _talk.dispose();
+    _idleController.dispose();
+    _speakingController.dispose();
     super.dispose();
   }
 
-  Widget _video(VideoPlayerController c) => FittedBox(
-        fit: BoxFit.cover,
-        child: SizedBox(
-          width: c.value.size.width,
-          height: c.value.size.height,
-          child: VideoPlayer(c),
-        ),
-      );
-
   @override
   Widget build(BuildContext context) {
-    if (_failed) {
-      // بديل بسيط في حال تعذّر تشغيل الفيديو
-      return Center(
-        child: AnimatedScale(
-          scale: widget.speaking ? 1.15 : 1.0,
-          duration: const Duration(milliseconds: 300),
-          child: const Icon(Icons.record_voice_over,
-              size: 120, color: Colors.white38),
+    if (!_isInitialized) {
+      return Container(
+        color: const Color(0xFF0B0D17),
+        child: const Center(
+          child: CircularProgressIndicator(color: Color(0xFF7C5CFF)),
         ),
       );
     }
-    if (!_ok) return const Center(child: CircularProgressIndicator());
 
-    return Stack(
-      fit: StackFit.expand,
+    // التبديل الفوري عبر IndexedStack يمنع إعادة بناء الشاشة أو حدوث ومضات سوداء
+    return IndexedStack(
+      index: widget.speaking ? 1 : 0,
       children: [
-        _video(_idle),
-        AnimatedOpacity(
-          opacity: widget.speaking ? 1 : 0,
-          duration: const Duration(milliseconds: 180),
-          child: _video(_talk),
+        // فيديو الاستماع/الانتظار (Idle)
+        SizedBox.expand(
+          child: FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width: _idleController.value.size.width > 0
+                  ? _idleController.value.size.width
+                  : 1080,
+              height: _idleController.value.size.height > 0
+                  ? _idleController.value.size.height
+                  : 1920,
+              child: VideoPlayer(_idleController),
+            ),
+          ),
+        ),
+        // فيديو الكلام (Speaking)
+        SizedBox.expand(
+          child: FittedBox(
+            fit: BoxFit.cover,
+            child: SizedBox(
+              width: _speakingController.value.size.width > 0
+                  ? _speakingController.value.size.width
+                  : 1080,
+              height: _speakingController.value.size.height > 0
+                  ? _speakingController.value.size.height
+                  : 1920,
+              child: VideoPlayer(_speakingController),
+            ),
+          ),
         ),
       ],
     );
