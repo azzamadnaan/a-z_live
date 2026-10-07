@@ -35,14 +35,12 @@ extension AccentX on Accent {
 }
 
 /// مشغّل المؤثرات الصوتية (الرنين، الاتصال، الإنهاء، الخطأ، المقاطعة)
-/// أي ملف صوتي ناقص لا يوقف التطبيق
 class SfxPlayer {
   final AudioPlayer _ring = AudioPlayer();
   final AudioPlayer _fx = AudioPlayer();
 
   Future<void> init() async {
     try {
-      // بدون أخذ Audio Focus حتى لا نقطع الميكروفون أو صوت الـ AI
       final ctx = AudioContext(
         android: const AudioContextAndroid(audioFocus: AndroidAudioFocus.none),
         iOS: AudioContextIOS(
@@ -93,17 +91,14 @@ class SfxPlayer {
 }
 
 /// خدمة الاتصال المباشر مع Gemini Live API
-/// المفتاح يأتي من --dart-define=GEMINI_API_KEY=... (يحقنه GitHub Actions)
 class GeminiLiveService {
   static const String _apiKey = String.fromEnvironment('GEMINI_API_KEY');
 
-  // تحقق من اسم النموذج الحالي في وثائق Gemini Live API
   static const String _model =
       'models/gemini-2.5-flash-native-audio-preview-09-2025';
   static const String _wsUrl =
       'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
-  // أقل مدة رنين قبل "الرد التلقائي" ليبدو كمكالمة حقيقية
   static const Duration _minRing = Duration(seconds: 3);
 
   // ---- حالات قابلة للمراقبة من الواجهة ----
@@ -127,13 +122,18 @@ class GeminiLiveService {
   StreamSubscription<Uint8List>? _micSub;
   Timer? _setupTimeout;
   Timer? _endSpeakTimer;
+  Timer? _networkTimeoutTimer; // مؤقت أمان عند بطء النت
 
-  bool _ready = false; // اكتمل setup وتم "الرد"
+  bool _ready = false;
   bool _firstConnectDone = false;
   bool _pcmReady = false;
   bool _disposed = false;
-  bool _dropAudio = false; // تجاهل بقية صوت الرد بعد مقاطعة المستخدم
+  bool _dropAudio = false;
   bool _turnCounted = false;
+  
+  // نظام قفل الحالة لحل مشكلة التذبذب عند ضعف النت
+  bool _isWaitingForResponse = false; 
+
   String _turnText = '';
   int _loudChunks = 0;
   DateTime _playUntil = DateTime.now();
@@ -148,7 +148,7 @@ class GeminiLiveService {
     callState.value = CallState.connecting;
     _ringStart = DateTime.now();
     await _sfx.init();
-    _sfx.startRing(); // نغمة الاتصال أثناء الاتصال
+    _sfx.startRing();
     try {
       if (_apiKey.isEmpty) {
         throw Exception(
@@ -167,8 +167,9 @@ class GeminiLiveService {
   void _fail(String msg) {
     if (_disposed || callState.value == CallState.failed) return;
     _setupTimeout?.cancel();
+    _networkTimeoutTimer?.cancel();
     _sfx.stopRing();
-    _sfx.play('error_alert.mp3'); // صوت الخطأ
+    _sfx.play('error_alert.mp3');
     errorMessage.value = msg;
     callState.value = CallState.failed;
   }
@@ -196,7 +197,6 @@ Start by greeting the learner and asking an easy question.''';
       },
     );
 
-    // مهلة 15 ثانية لاكتمال الاتصال
     _setupTimeout?.cancel();
     _setupTimeout = Timer(const Duration(seconds: 15), () {
       if (!_ready) _fail('انتهت مهلة الاتصال. حاول مرة أخرى.');
@@ -226,11 +226,10 @@ Start by greeting the learner and asking an easy question.''';
 
   void _send(Map<String, dynamic> m) => _ch?.sink.add(jsonEncode(m));
 
-  // ================= الرد التلقائي بعد اكتمال الاتصال =================
+  // ================= الرد التلقائي =================
   Future<void> _handleSetupComplete() async {
     final firstTime = !_firstConnectDone;
     if (firstTime) {
-      // نترك الرنين يُسمع 3 ثوانٍ على الأقل
       final waited = DateTime.now().difference(_ringStart ?? DateTime.now());
       if (waited < _minRing) await Future.delayed(_minRing - waited);
     }
@@ -241,20 +240,31 @@ Start by greeting the learner and asking an easy question.''';
 
     if (firstTime) {
       _sfx.stopRing();
-      _sfx.play('connected.mp3'); // نغمة الرد
+      _sfx.play('connected.mp3');
       startedAt = DateTime.now();
       callState.value = CallState.connected;
       _send({
         'realtimeInput': {'text': 'Hi coach, please start the lesson.'}
       });
+      _lockForResponse();
     } else {
-      // إعادة اتصال بعد تغيير اللهجة
       _send({
         'realtimeInput': {
           'text': 'Please continue our conversation using your new accent.'
         }
       });
+      _lockForResponse();
     }
+  }
+
+  // ================= قفل الحالة أثناء انتظار الرد =================
+  void _lockForResponse() {
+    _isWaitingForResponse = true;
+    _networkTimeoutTimer?.cancel();
+    // مهلة 12 ثانية فقط لو انقطع النت كلياً لفك القفل بدون تذبذب
+    _networkTimeoutTimer = Timer(const Duration(seconds: 12), () {
+      _isWaitingForResponse = false;
+    });
   }
 
   // ================= الميكروفون =================
@@ -263,7 +273,7 @@ Start by greeting the learner and asking an easy question.''';
       encoder: AudioEncoder.pcm16bits,
       sampleRate: 16000,
       numChannels: 1,
-      echoCancel: true, // يمنع الميكروفون من التقاط صوت الـ AI
+      echoCancel: true,
       noiseSuppress: true,
       autoGain: true,
     ));
@@ -272,7 +282,7 @@ Start by greeting the learner and asking an easy question.''';
       final level = _rms(chunk);
       micLevel.value = muted.value ? 0 : level;
 
-      // ---- نظام المقاطعة: المستخدم تكلّم أثناء كلام الـ AI ----
+      // المقاطعة فقط أثناء كلام الذكاء الاصطناعي
       if (aiState.value == AiState.speaking && !muted.value) {
         _loudChunks = level > 0.12 ? _loudChunks + 1 : 0;
         if (_loudChunks >= 2) {
@@ -282,6 +292,11 @@ Start by greeting the learner and asking an easy question.''';
       }
 
       if (_ready && !muted.value) {
+        // قفل التبديل إلى حالة الانتظار عند إرسال الصوت
+        if (level > 0.15 && !_isWaitingForResponse && aiState.value == AiState.idle) {
+          _lockForResponse();
+        }
+
         _send({
           'realtimeInput': {
             'audio': {
@@ -331,7 +346,6 @@ Start by greeting the learner and asking an easy question.''';
     final sc = msg['serverContent'] as Map<String, dynamic>?;
     if (sc == null) return;
 
-    // الخادم نفسه اكتشف مقاطعة
     if (sc['interrupted'] == true) {
       _dropAudio = false;
       interrupt();
@@ -341,6 +355,9 @@ Start by greeting the learner and asking an easy question.''';
     for (final p in parts) {
       final inline = p['inlineData'];
       if (inline != null && inline['data'] != null && !_dropAudio) {
+        // فك القفل واستقبال صوت الرد
+        _networkTimeoutTimer?.cancel();
+        _isWaitingForResponse = false;
         _playChunk(base64Decode(inline['data'] as String));
       }
     }
@@ -362,12 +379,12 @@ Start by greeting the learner and asking an easy question.''';
 
     if (sc['turnComplete'] == true) {
       _dropAudio = false;
+      _isWaitingForResponse = false;
       if (_turnCounted && _turnText.trim().isNotEmpty) {
         takeaways.add(_turnText.trim());
       }
       _turnCounted = false;
       _turnText = '';
-      // العودة إلى idle تتم تلقائياً بعد انتهاء آخر حزمة صوت (انظر _playChunk)
     }
   }
 
@@ -380,7 +397,7 @@ Start by greeting the learner and asking an easy question.''';
     transcript.value = List.of(_lines);
   }
 
-  // ================= تشغيل الصوت (PCM 24kHz) =================
+  // ================= تشغيل الصوت =================
   Future<void> _ensurePcm() async {
     if (_pcmReady) return;
     await FlutterPcmSound.setup(sampleRate: 24000, channelCount: 1);
@@ -390,12 +407,12 @@ Start by greeting the learner and asking an easy question.''';
   }
 
   void _goIdle() {
+    _isWaitingForResponse = false;
     aiState.value = AiState.idle;
     aiLevel.value = 0;
   }
 
   Future<void> _playChunk(Uint8List bytes) async {
-    // فيديو الكلام يبدأ مع أول حزمة صوت من Gemini
     if (aiState.value != AiState.speaking) aiState.value = AiState.speaking;
 
     await _ensurePcm();
@@ -404,12 +421,11 @@ Start by greeting the learner and asking an easy question.''';
     await FlutterPcmSound.feed(PcmArrayInt16(bytes: bd));
     aiLevel.value = _rms(bytes);
 
-    final ms = bytes.lengthInBytes ~/ 48; // 24000Hz × 2 byte = 48 byte/ms
+    final ms = bytes.lengthInBytes ~/ 48;
     final now = DateTime.now();
     final base = _playUntil.isAfter(now) ? _playUntil : now;
     _playUntil = base.add(Duration(milliseconds: ms));
 
-    // بعد كل حزمة نؤجّل العودة إلى idle إلى لحظة انتهاء الصوت المتبقي
     _endSpeakTimer?.cancel();
     _endSpeakTimer = Timer(
       _playUntil.difference(DateTime.now()) + const Duration(milliseconds: 150),
@@ -423,30 +439,31 @@ Start by greeting the learner and asking an easy question.''';
     _goIdle();
     if (_pcmReady) {
       _pcmReady = false;
-      await FlutterPcmSound.release(); // يمسح الصوت المتبقي فوراً
+      await FlutterPcmSound.release();
     }
   }
 
-  /// مقاطعة فورية: إيقاف صوت الـ AI + إيقاف أنيميشن الكلام + صوت pop
+  /// مقاطعة فورية
   Future<void> interrupt() async {
     if (aiState.value != AiState.speaking && !_pcmReady) return;
-    _dropAudio = true; // نتجاهل ما تبقى من رد الـ AI القديم
+    _dropAudio = true;
+    _isWaitingForResponse = false;
+    _networkTimeoutTimer?.cancel();
     _turnText = '';
     _turnCounted = false;
     await _stopPlayback();
     _sfx.play('interrupted.mp3');
   }
 
-  // ================= الإعدادات =================
+  // ================= الإعدادات والإنهاء =================
   void toggleMute() => muted.value = !muted.value;
 
-  /// تغيير اللهجة: نعيد فتح الجلسة بتعليمات جديدة
   Future<void> setAccent(Accent a) async {
     if (a == accent.value || _disposed) return;
     accent.value = a;
     await _stopPlayback();
     _ready = false;
-    await _wsSub?.cancel(); // حتى لا يُعتبر الإغلاق انقطاعاً
+    await _wsSub?.cancel();
     await _ch?.sink.close();
     try {
       await _connect();
@@ -455,13 +472,12 @@ Start by greeting the learner and asking an easy question.''';
     }
   }
 
-  /// إنهاء المكالمة وتحرير كل الموارد
-  /// playEndSound=false عند الفشل أو الإغلاق الصامت حتى لا يتداخل مع صوت الخطأ
   Future<void> stop({bool playEndSound = true}) async {
     if (_disposed) return;
     _disposed = true;
     _setupTimeout?.cancel();
     _endSpeakTimer?.cancel();
+    _networkTimeoutTimer?.cancel();
     await _sfx.stopRing();
     if (playEndSound) _sfx.play('call_end.mp3');
     try {
@@ -475,7 +491,6 @@ Start by greeting the learner and asking an easy question.''';
       debugPrint('stop error: $e');
     }
     _pcmReady = false;
-    // نترك صوت الإنهاء أو الخطأ يكتمل قبل التحرير
     Future.delayed(const Duration(seconds: 3), _sfx.dispose);
   }
 }
