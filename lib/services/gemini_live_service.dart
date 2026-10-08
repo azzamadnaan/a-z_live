@@ -35,12 +35,14 @@ extension AccentX on Accent {
 }
 
 /// مشغّل المؤثرات الصوتية (الرنين، الاتصال، الإنهاء، الخطأ، المقاطعة)
+/// أي ملف صوتي ناقص لا يوقف التطبيق
 class SfxPlayer {
   final AudioPlayer _ring = AudioPlayer();
   final AudioPlayer _fx = AudioPlayer();
 
   Future<void> init() async {
     try {
+      // بدون أخذ Audio Focus حتى لا نقطع الميكروفون أو صوت الـ AI
       final ctx = AudioContext(
         android: const AudioContextAndroid(audioFocus: AndroidAudioFocus.none),
         iOS: AudioContextIOS(
@@ -91,20 +93,39 @@ class SfxPlayer {
 }
 
 /// خدمة الاتصال المباشر مع Gemini Live API
+/// المفتاح يأتي من --dart-define=GEMINI_API_KEY=... (يحقنه GitHub Actions)
 class GeminiLiveService {
   static const String _apiKey = String.fromEnvironment('GEMINI_API_KEY');
 
+  // تحقق من اسم النموذج الحالي في وثائق Gemini Live API
   static const String _model =
       'models/gemini-2.5-flash-native-audio-preview-09-2025';
   static const String _wsUrl =
       'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
+  /// true  = يبقى الأفاتار على فيديو الكلام ولا يرجع للاستماع إلا عند سماع كلام واضح من المستخدم
+  /// false = السلوك القديم: يرجع للاستماع بعد انتهاء صوت المدرّب
+  static const bool stayInSpeakingUntilClearSpeech = true;
+
+  // أقل مدة رنين قبل "الرد التلقائي" ليبدو كمكالمة حقيقية
   static const Duration _minRing = Duration(seconds: 3);
+
+  // أقصى مدة انقطاع متواصل قبل اعتبار المكالمة فاشلة
+  static const Duration _maxOffline = Duration(seconds: 30);
+
+  // فواصل إعادة الاتصال التلقائي بالثواني (تصاعدي)
+  static const List<int> _backoffSeconds = [1, 2, 4, 8];
+
+  // كلمات حشو لا تُعد كلاماً واضحاً
+  static const Set<String> _fillers = {
+    'uh', 'um', 'umm', 'hmm', 'hm', 'ah', 'er', 'eh', 'mm', 'oh', 'huh', 'aa',
+  };
 
   // ---- حالات قابلة للمراقبة من الواجهة ----
   final callState = ValueNotifier<CallState>(CallState.connecting);
   final errorMessage = ValueNotifier<String?>(null);
   final aiState = ValueNotifier<AiState>(AiState.idle);
+  final reconnecting = ValueNotifier<bool>(false); // شريط "Reconnecting..."
   final micLevel = ValueNotifier<double>(0);
   final aiLevel = ValueNotifier<double>(0);
   final transcript = ValueNotifier<List<TranscriptLine>>([]);
@@ -121,34 +142,37 @@ class GeminiLiveService {
   StreamSubscription? _wsSub;
   StreamSubscription<Uint8List>? _micSub;
   Timer? _setupTimeout;
-  Timer? _endSpeakTimer;
-  Timer? _networkTimeoutTimer; // مؤقت أمان عند بطء النت
+  Timer? _endSpeakTimer; // يُستخدم فقط عند stayInSpeakingUntilClearSpeech=false
+  Timer? _reconnectTimer;
 
-  bool _ready = false;
+  bool _ready = false; // اكتمل setup وتم "الرد"
   bool _firstConnectDone = false;
   bool _pcmReady = false;
   bool _disposed = false;
-  bool _dropAudio = false;
+  bool _dropAudio = false; // تجاهل بقية صوت الرد بعد مقاطعة المستخدم
   bool _turnCounted = false;
-  
-  // نظام قفل الحالة لحل مشكلة التذبذب عند ضعف النت
-  bool _isWaitingForResponse = false; 
-
   String _turnText = '';
+  String _userText = ''; // ما قاله المستخدم منذ آخر رد (من transcription)
+  String? _resumeText; // رسالة المتابعة بعد إعادة الاتصال أو تغيير اللهجة
   int _loudChunks = 0;
+  int _attempt = 0;
   DateTime _playUntil = DateTime.now();
   DateTime? _ringStart;
+  DateTime? _offlineSince;
   DateTime? startedAt;
 
   Duration get elapsed =>
       startedAt == null ? Duration.zero : DateTime.now().difference(startedAt!);
+
+  /// هل ما زال صوت المدرّب يُشغَّل الآن؟
+  bool get _isPlaying => _playUntil.isAfter(DateTime.now());
 
   // ================= بدء الجلسة =================
   Future<void> start() async {
     callState.value = CallState.connecting;
     _ringStart = DateTime.now();
     await _sfx.init();
-    _sfx.startRing();
+    _sfx.startRing(); // نغمة الاتصال أثناء الاتصال
     try {
       if (_apiKey.isEmpty) {
         throw Exception(
@@ -167,21 +191,27 @@ class GeminiLiveService {
   void _fail(String msg) {
     if (_disposed || callState.value == CallState.failed) return;
     _setupTimeout?.cancel();
-    _networkTimeoutTimer?.cancel();
+    _reconnectTimer?.cancel();
+    reconnecting.value = false;
     _sfx.stopRing();
-    _sfx.play('error_alert.mp3');
+    _sfx.play('error_alert.mp3'); // صوت الخطأ
     errorMessage.value = msg;
     callState.value = CallState.failed;
   }
 
+  // ================= شخصية المدرّب =================
   String _systemPrompt() => '''
 You are "Coach A", an engaging, slightly strict English tutor in the app A-Z Live.
 Speak ONLY in ${accent.value.prompt}. Keep replies short (1-3 sentences) and always end with a question to keep the learner talking.
 Listen carefully to the learner's grammar and pronunciation.
-If they make a mistake, say exactly: "You are half wrong! <correction>..." or "Almost! Here is how a native says it: <correction>".
-Then ask them to repeat it. If they are correct, praise briefly and continue the conversation.
+When the learner's speech is unclear, broken, or badly pronounced, do NOT ignore it. First say what you understood in a friendly way, answer it briefly, then give the correct sentence, then ask the learner to repeat it.
+Example: if the learner says "hoo yoo ar", reply: "I think you said: how are you? I'm fine, thank you! You can say it like this: How are you? Please correct that and try again."
+Always begin the correction with "You are half wrong!" or "Almost! Here is how a native says it:".
+If you cannot understand anything at all, say: "Sorry, I could not understand. Please say it again slowly."
+If they are correct, praise briefly and continue the conversation.
 Start by greeting the learner and asking an easy question.''';
 
+  // ================= الاتصال بالخادم =================
   Future<void> _connect() async {
     _ready = false;
     _ch = WebSocketChannel.connect(Uri.parse('$_wsUrl?key=$_apiKey'));
@@ -189,17 +219,19 @@ Start by greeting the learner and asking an easy question.''';
 
     _wsSub = _ch!.stream.listen(
       _onMessage,
-      onError: (e) => _fail('خطأ في الاتصال: $e'),
-      onDone: () {
-        if (!_disposed && callState.value != CallState.failed) {
-          _fail('انقطع الاتصال بالخادم.');
-        }
-      },
+      onError: (e) => _onWsLost('خطأ في الاتصال: $e'),
+      onDone: () => _onWsLost('انقطع الاتصال بالخادم.'),
     );
 
+    // مهلة 15 ثانية لاكتمال الاتصال
     _setupTimeout?.cancel();
     _setupTimeout = Timer(const Duration(seconds: 15), () {
-      if (!_ready) _fail('انتهت مهلة الاتصال. حاول مرة أخرى.');
+      if (_ready || _disposed) return;
+      if (callState.value == CallState.connected) {
+        _scheduleReconnect(); // أثناء المكالمة: نعيد المحاولة بصمت
+      } else {
+        _fail('انتهت مهلة الاتصال. حاول مرة أخرى.');
+      }
     });
 
     _send({
@@ -224,12 +256,83 @@ Start by greeting the learner and asking an easy question.''';
     });
   }
 
-  void _send(Map<String, dynamic> m) => _ch?.sink.add(jsonEncode(m));
+  void _send(Map<String, dynamic> m) {
+    try {
+      _ch?.sink.add(jsonEncode(m));
+    } catch (_) {
+      // الإرسال أثناء انقطاع الشبكة لا يجب أن يوقف التطبيق
+    }
+  }
 
-  // ================= الرد التلقائي =================
+  // ================= انقطاع الإنترنت وإعادة الاتصال =================
+  /// فقدنا الاتصال: قبل الرد = فشل، بعد الرد = إعادة اتصال بدون تغيير الأفاتار
+  void _onWsLost(String msg) {
+    if (_disposed) return;
+    if (callState.value == CallState.connected) {
+      _handleDisconnect();
+    } else {
+      _fail(msg);
+    }
+  }
+
+  void _handleDisconnect() {
+    if (_disposed || callState.value != CallState.connected) return;
+    _ready = false;
+    _resumeText = _buildResumeText(connectionLost: true);
+    reconnecting.value = true;
+    _offlineSince ??= DateTime.now();
+    _scheduleReconnect();
+  }
+
+  void _scheduleReconnect() {
+    if (_disposed) return;
+    if (_reconnectTimer?.isActive ?? false) return;
+
+    final since = _offlineSince ??= DateTime.now();
+    reconnecting.value = true;
+
+    // انقطاع متواصل أكثر من 30 ثانية: تفشل المكالمة
+    if (DateTime.now().difference(since) > _maxOffline) {
+      _fail('انقطع الإنترنت لأكثر من 30 ثانية. تأكد من الاتصال ثم أعد الاتصال.');
+      return;
+    }
+
+    final delay = _backoffSeconds[math.min(_attempt, _backoffSeconds.length - 1)];
+    _attempt++;
+    _reconnectTimer = Timer(Duration(seconds: delay), _tryReconnect);
+  }
+
+  Future<void> _tryReconnect() async {
+    if (_disposed || callState.value != CallState.connected) return;
+    try {
+      await _wsSub?.cancel(); // حتى لا يُعتبر إغلاق القديم انقطاعاً جديداً
+      try {
+        await _ch?.sink.close();
+      } catch (_) {}
+      await _connect();
+    } catch (_) {
+      _scheduleReconnect();
+    }
+  }
+
+  /// نص يُرسل للمدرّب بعد إعادة الاتصال أو تغيير اللهجة ليكمل من حيث توقف
+  String _buildResumeText({required bool connectionLost}) {
+    final last = _lines.length > 4 ? _lines.sublist(_lines.length - 4) : _lines;
+    final recent = last
+        .map((l) => '${l.isUser ? "Learner" : "Coach"}: ${l.text}')
+        .join(' | ');
+    final head = connectionLost
+        ? 'The connection was interrupted for a moment.'
+        : 'Please switch to your new accent (${accent.value.prompt}).';
+    final ctx = recent.isEmpty ? '' : ' Recent conversation: $recent.';
+    return '$head$ctx Continue the lesson naturally and do not greet me again.';
+  }
+
+  // ================= الرد التلقائي بعد اكتمال الاتصال =================
   Future<void> _handleSetupComplete() async {
     final firstTime = !_firstConnectDone;
     if (firstTime) {
+      // نترك الرنين يُسمع 3 ثوانٍ على الأقل
       final waited = DateTime.now().difference(_ringStart ?? DateTime.now());
       if (waited < _minRing) await Future.delayed(_minRing - waited);
     }
@@ -237,34 +340,30 @@ Start by greeting the learner and asking an easy question.''';
 
     _ready = true;
     _firstConnectDone = true;
+    _dropAudio = false;
 
     if (firstTime) {
       _sfx.stopRing();
-      _sfx.play('connected.mp3');
+      _sfx.play('connected.mp3'); // نغمة الرد
       startedAt = DateTime.now();
       callState.value = CallState.connected;
       _send({
         'realtimeInput': {'text': 'Hi coach, please start the lesson.'}
       });
-      _lockForResponse();
     } else {
+      // رجع الاتصال بعد انقطاع أو بعد تغيير اللهجة
+      _offlineSince = null;
+      _attempt = 0;
+      _reconnectTimer?.cancel();
+      reconnecting.value = false;
       _send({
         'realtimeInput': {
-          'text': 'Please continue our conversation using your new accent.'
+          'text': _resumeText ??
+              'Please continue our conversation naturally and do not greet me again.'
         }
       });
-      _lockForResponse();
+      _resumeText = null;
     }
-  }
-
-  // ================= قفل الحالة أثناء انتظار الرد =================
-  void _lockForResponse() {
-    _isWaitingForResponse = true;
-    _networkTimeoutTimer?.cancel();
-    // مهلة 12 ثانية فقط لو انقطع النت كلياً لفك القفل بدون تذبذب
-    _networkTimeoutTimer = Timer(const Duration(seconds: 12), () {
-      _isWaitingForResponse = false;
-    });
   }
 
   // ================= الميكروفون =================
@@ -273,7 +372,7 @@ Start by greeting the learner and asking an easy question.''';
       encoder: AudioEncoder.pcm16bits,
       sampleRate: 16000,
       numChannels: 1,
-      echoCancel: true,
+      echoCancel: true, // يمنع الميكروفون من التقاط صوت الـ AI
       noiseSuppress: true,
       autoGain: true,
     ));
@@ -282,8 +381,8 @@ Start by greeting the learner and asking an easy question.''';
       final level = _rms(chunk);
       micLevel.value = muted.value ? 0 : level;
 
-      // المقاطعة فقط أثناء كلام الذكاء الاصطناعي
-      if (aiState.value == AiState.speaking && !muted.value) {
+      // ---- نظام المقاطعة: المستخدم تكلّم أثناء تشغيل صوت المدرّب ----
+      if (_isPlaying && !muted.value) {
         _loudChunks = level > 0.12 ? _loudChunks + 1 : 0;
         if (_loudChunks >= 2) {
           _loudChunks = 0;
@@ -292,11 +391,6 @@ Start by greeting the learner and asking an easy question.''';
       }
 
       if (_ready && !muted.value) {
-        // قفل التبديل إلى حالة الانتظار عند إرسال الصوت
-        if (level > 0.15 && !_isWaitingForResponse && aiState.value == AiState.idle) {
-          _lockForResponse();
-        }
-
         _send({
           'realtimeInput': {
             'audio': {
@@ -319,6 +413,31 @@ Start by greeting the learner and asking an easy question.''';
       sum += s * s;
     }
     return math.min(1.0, math.sqrt(sum / n) * 4);
+  }
+
+  // ================= الكلام الواضح =================
+  /// هل نص المستخدم "كلام واضح" يمكن تفسيره؟
+  /// الشروط: كلمتان لاتينيتان على الأقل (غير الحشو)، وبمجموع 4 أحرف أو أكثر،
+  /// وليست حرفاً مكرراً. (الكلام بغير الإنجليزية لا يُعد واضحاً هنا)
+  bool _isClearSpeech(String text) {
+    final words = RegExp(r"[A-Za-z']+")
+        .allMatches(text)
+        .map((m) => m.group(0)!.toLowerCase())
+        .where((w) => !_fillers.contains(w))
+        .toList();
+    if (words.length < 2) return false;
+    final letters = words.join().replaceAll("'", '');
+    if (letters.length < 4) return false;
+    if (letters.split('').toSet().length < 3) return false; // مثل: aaaa bbbb
+    return true;
+  }
+
+  /// ننتقل إلى idle فقط عند سماع كلام واضح، وبعد توقف صوت المدرّب
+  void _checkClearSpeech() {
+    if (!stayInSpeakingUntilClearSpeech) return;
+    if (aiState.value != AiState.speaking) return;
+    if (_isPlaying) return;
+    if (_isClearSpeech(_userText)) _goIdle();
   }
 
   // ================= استقبال الرسائل =================
@@ -346,25 +465,28 @@ Start by greeting the learner and asking an easy question.''';
     final sc = msg['serverContent'] as Map<String, dynamic>?;
     if (sc == null) return;
 
+    // الخادم نفسه اكتشف مقاطعة
     if (sc['interrupted'] == true) {
-      _dropAudio = false;
-      interrupt();
+      _handleServerInterrupted();
     }
 
     final parts = (sc['modelTurn']?['parts'] as List?) ?? const [];
     for (final p in parts) {
       final inline = p['inlineData'];
       if (inline != null && inline['data'] != null && !_dropAudio) {
-        // فك القفل واستقبال صوت الرد
-        _networkTimeoutTimer?.cancel();
-        _isWaitingForResponse = false;
         _playChunk(base64Decode(inline['data'] as String));
       }
     }
 
+    // ما قاله المستخدم (transcription)
     final inT = sc['inputTranscription']?['text'] as String?;
-    if (inT != null && inT.isNotEmpty) _appendLine(true, inT);
+    if (inT != null && inT.isNotEmpty) {
+      _appendLine(true, inT);
+      _userText += inT;
+      _checkClearSpeech();
+    }
 
+    // ما يقوله المدرّب (transcription)
     final outT = sc['outputTranscription']?['text'] as String?;
     if (outT != null && outT.isNotEmpty && !_dropAudio) {
       _appendLine(false, outT);
@@ -379,12 +501,13 @@ Start by greeting the learner and asking an easy question.''';
 
     if (sc['turnComplete'] == true) {
       _dropAudio = false;
-      _isWaitingForResponse = false;
       if (_turnCounted && _turnText.trim().isNotEmpty) {
         takeaways.add(_turnText.trim());
       }
       _turnCounted = false;
       _turnText = '';
+      _userText = ''; // بداية استماع جديد
+      // لا نعود إلى idle هنا: العودة تتم فقط عند سماع كلام واضح
     }
   }
 
@@ -397,7 +520,7 @@ Start by greeting the learner and asking an easy question.''';
     transcript.value = List.of(_lines);
   }
 
-  // ================= تشغيل الصوت =================
+  // ================= تشغيل الصوت (PCM 24kHz) =================
   Future<void> _ensurePcm() async {
     if (_pcmReady) return;
     await FlutterPcmSound.setup(sampleRate: 24000, channelCount: 1);
@@ -407,12 +530,15 @@ Start by greeting the learner and asking an easy question.''';
   }
 
   void _goIdle() {
-    _isWaitingForResponse = false;
     aiState.value = AiState.idle;
     aiLevel.value = 0;
   }
 
   Future<void> _playChunk(Uint8List bytes) async {
+    // أول حزمة من رد جديد: نبدأ تجميع كلام المستخدم من الصفر
+    if (!_isPlaying) _userText = '';
+
+    // فيديو الكلام يبدأ مع أول حزمة صوت من Gemini
     if (aiState.value != AiState.speaking) aiState.value = AiState.speaking;
 
     await _ensurePcm();
@@ -421,76 +547,72 @@ Start by greeting the learner and asking an easy question.''';
     await FlutterPcmSound.feed(PcmArrayInt16(bytes: bd));
     aiLevel.value = _rms(bytes);
 
-    final ms = bytes.lengthInBytes ~/ 48;
+    final ms = bytes.lengthInBytes ~/ 48; // 24000Hz × 2 byte = 48 byte/ms
     final now = DateTime.now();
     final base = _playUntil.isAfter(now) ? _playUntil : now;
     _playUntil = base.add(Duration(milliseconds: ms));
 
-    _endSpeakTimer?.cancel();
-    _endSpeakTimer = Timer(
-      _playUntil.difference(DateTime.now()) + const Duration(milliseconds: 150),
-      _goIdle,
-    );
+    // السلوك القديم فقط: العودة إلى idle بعد انتهاء الصوت المتبقي
+    if (!stayInSpeakingUntilClearSpeech) {
+      _endSpeakTimer?.cancel();
+      _endSpeakTimer = Timer(
+        _playUntil.difference(DateTime.now()) +
+            const Duration(milliseconds: 150),
+        _goIdle,
+      );
+    }
   }
 
   Future<void> _stopPlayback() async {
     _endSpeakTimer?.cancel();
     _playUntil = DateTime.now();
-    _goIdle();
+    aiLevel.value = 0;
+    // في الوضع الجديد يبقى الأفاتار على الكلام حتى يتكلم المستخدم بوضوح
+    if (!stayInSpeakingUntilClearSpeech) _goIdle();
     if (_pcmReady) {
       _pcmReady = false;
-      await FlutterPcmSound.release();
+      await FlutterPcmSound.release(); // يمسح الصوت المتبقي فوراً
     }
   }
 
-  /// مقاطعة فورية
+  /// مقاطعة محلية: إيقاف صوت المدرّب فوراً + صوت pop
+  /// الأفاتار لا يتحول لـ idle إلا إذا كان كلام المستخدم واضحاً
   Future<void> interrupt() async {
-    if (aiState.value != AiState.speaking && !_pcmReady) return;
-    _dropAudio = true;
-    _isWaitingForResponse = false;
-    _networkTimeoutTimer?.cancel();
+    if (!_isPlaying) return;
+    _dropAudio = true; // نتجاهل ما تبقى من رد المدرّب القديم
     _turnText = '';
     _turnCounted = false;
     await _stopPlayback();
     _sfx.play('interrupted.mp3');
+    _checkClearSpeech();
   }
 
-  // ================= الإعدادات والإنهاء =================
+  /// الخادم أبلغنا بالمقاطعة (وأوقف التوليد من جهته)
+  Future<void> _handleServerInterrupted() async {
+    final wasPlaying = _isPlaying;
+    _turnText = '';
+    _turnCounted = false;
+    await _stopPlayback();
+    _dropAudio = false; // الخادم ألغى الرد القديم، فالرد القادم جديد
+    if (wasPlaying) _sfx.play('interrupted.mp3');
+    _checkClearSpeech();
+  }
+
+  // ================= الإعدادات =================
   void toggleMute() => muted.value = !muted.value;
 
+  /// تغيير اللهجة: نعيد فتح الجلسة بتعليمات جديدة
   Future<void> setAccent(Accent a) async {
     if (a == accent.value || _disposed) return;
     accent.value = a;
     await _stopPlayback();
     _ready = false;
-    await _wsSub?.cancel();
-    await _ch?.sink.close();
+    _resumeText = _buildResumeText(connectionLost: false);
+    await _wsSub?.cancel(); // حتى لا يُعتبر الإغلاق انقطاعاً
+    try {
+      await _ch?.sink.close();
+    } catch (_) {}
     try {
       await _connect();
-    } catch (e) {
-      _fail('تعذر تغيير اللهجة: $e');
-    }
-  }
-
-  Future<void> stop({bool playEndSound = true}) async {
-    if (_disposed) return;
-    _disposed = true;
-    _setupTimeout?.cancel();
-    _endSpeakTimer?.cancel();
-    _networkTimeoutTimer?.cancel();
-    await _sfx.stopRing();
-    if (playEndSound) _sfx.play('call_end.mp3');
-    try {
-      await _micSub?.cancel();
-      await _rec.stop();
-      await _rec.dispose();
-      await _wsSub?.cancel();
-      await _ch?.sink.close();
-      if (_pcmReady) await FlutterPcmSound.release();
-    } catch (e) {
-      debugPrint('stop error: $e');
-    }
-    _pcmReady = false;
-    Future.delayed(const Duration(seconds: 3), _sfx.dispose);
-  }
-}
+    } catch (_) {
+      // لم ينجح الاتصال الآن: نعيد المحاولة تلقائياً با
