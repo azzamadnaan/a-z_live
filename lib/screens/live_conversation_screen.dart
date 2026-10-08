@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:ui';
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' show ValueListenable;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../services/gemini_live_service.dart';
@@ -325,6 +325,8 @@ class _LiveConversationScreenState extends State<LiveConversationScreen>
                 _topBar(),
                 const SizedBox(height: 8),
                 _statusChip(),
+                const SizedBox(height: 8),
+                _reconnectBanner(),
                 const Spacer(),
                 if (_showTranscript) _transcript(),
                 const SizedBox(height: 12),
@@ -383,6 +385,30 @@ class _LiveConversationScreenState extends State<LiveConversationScreen>
           style: const TextStyle(fontSize: 13, color: Colors.white70),
         ),
       ),
+    );
+  }
+
+  // شريط إعادة الاتصال عند انقطاع الإنترنت (لا يغيّر الأفاتار)
+  Widget _reconnectBanner() {
+    return ValueListenableBuilder<bool>(
+      valueListenable: _svc.reconnecting,
+      builder: (_, r, __) {
+        if (!r) return const SizedBox.shrink();
+        return const _Glass(
+          radius: 20,
+          padding: EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+          child: Row(mainAxisSize: MainAxisSize.min, children: [
+            SizedBox(
+              width: 14,
+              height: 14,
+              child: CircularProgressIndicator(strokeWidth: 2),
+            ),
+            SizedBox(width: 10),
+            Text('Reconnecting...',
+                style: TextStyle(fontSize: 13, color: Colors.orangeAccent)),
+          ]),
+        );
+      },
     );
   }
 
@@ -603,67 +629,4 @@ class _WavePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_WavePainter old) => true;
-}
-
-// =============== نص حقوق المبرمج بتدرج لوني متحرك ===============
-class AnimatedGradientText extends StatefulWidget {
-  final double fontSize;
-  const AnimatedGradientText({super.key, this.fontSize = 14});
-
-  @override
-  State<AnimatedGradientText> createState() => _AnimatedGradientTextState();
-}
-
-class _AnimatedGradientTextState extends State<AnimatedGradientText>
-    with SingleTickerProviderStateMixin {
-  late AnimationController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = AnimationController(
-      vsync: this,
-      duration: const Duration(seconds: 3),
-    )..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AnimatedBuilder(
-      animation: _controller,
-      builder: (context, child) {
-        return ShaderMask(
-          shaderCallback: (bounds) {
-            return LinearGradient(
-              colors: const [
-                Color(0xFF7C5CFF),
-                Color(0xFF22D3EE),
-                Color(0xFF2ECC71),
-              ],
-              stops: [
-                0.0,
-                _controller.value,
-                1.0,
-              ],
-            ).createShader(bounds);
-          },
-          child: Text(
-            'جميع الحقوق محفوظة لدى المبرمج عزام عدنان المخلافي',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontSize: widget.fontSize,
-              fontWeight: FontWeight.bold,
-              color: Colors.white,
-            ),
-          ),
-        );
-      },
-    );
-  }
 }
